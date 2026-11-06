@@ -22,7 +22,10 @@ Everything happens in ONE ffmpeg pass, with no intermediate files:
 The render is written to "<name>.partial.mp4" and renamed when it finishes,
 so a cancelled or failed render never leaves a broken file behind.
 
-Usage (or use the GUI: run_gui.bat / gui.py):
+No NVIDIA GPU? --cpu-decode --cpu-encode does the same on the CPU (libx264/libx265).
+
+Usage (or use the GUI: run_gui.bat / gui.py, or the web UI: gradio_app.py, e.g. on
+Google Colab via VisualSync_Colab.ipynb):
     .venv\\Scripts\\python make_dance_video.py --bpm 125
     .venv\\Scripts\\python make_dance_video.py            (asks for the BPMs)
     .venv\\Scripts\\python make_dance_video.py --bpm 124 --preview 60
@@ -217,15 +220,23 @@ def check_bpm(value: float, what: str) -> None:
         raise RenderError(f"{what} {value:g} looks wrong (expected roughly 122-126)")
 
 
-def check_nvenc(encoder: str) -> None:
-    """Fail early with a clear message if NVENC can't actually open."""
+def check_encoder(encoder: str) -> None:
+    """Fail early with a clear message if the video encoder can't actually open."""
     proc = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
          "color=c=black:s=1280x720:r=24:d=0.2", "-c:v", encoder, "-f", "null", "-"],
         capture_output=True, text=True, creationflags=NO_WINDOW)
     if proc.returncode != 0:
-        raise RenderError(f"{encoder} is not usable on this machine:\n{proc.stderr.strip()}\n"
-                          "Update the NVIDIA driver, or close other apps using NVENC.")
+        hint = ("Update the NVIDIA driver, close other apps using NVENC, or use CPU encoding."
+                if "nvenc" in encoder else "This ffmpeg build doesn't include that encoder.")
+        raise RenderError(f"{encoder} is not usable on this machine:\n{proc.stderr.strip()}\n{hint}")
+
+
+check_nvenc = check_encoder   # older name, still used by gui.py
+
+# NVENC preset -> closest x264/x265 preset, for CPU encoding.
+CPU_PRESETS = {"p1": "ultrafast", "p2": "superfast", "p3": "veryfast", "p4": "faster",
+               "p5": "fast", "p6": "medium", "p7": "slow"}
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +261,7 @@ class Settings:
     preset: str = "p7"
     audio_bitrate: str = "320k"
     cpu_decode: bool = False
+    cpu_encode: bool = False             # libx264/libx265 instead of NVENC (no NVIDIA GPU)
     preview: float | None = None         # render only the first N seconds
     output: Path | None = None           # None = ./output/<auto name>.mp4
     overlay: Path | None = None          # transparent image shown centred over the intro
@@ -295,7 +307,19 @@ class Plan:
 
     @property
     def encoder(self) -> str:
+        if self.settings.cpu_encode:
+            return "libx265" if self.settings.codec == "hevc" else "libx264"
         return f"{self.settings.codec}_nvenc"
+
+    @property
+    def cpu_preset(self) -> str:
+        return CPU_PRESETS.get(self.settings.preset, self.settings.preset)
+
+    def encoder_label(self) -> str:
+        s = self.settings
+        if s.cpu_encode:
+            return f"{s.codec.upper()} {self.encoder} (CPU) CRF {s.cq} {self.cpu_preset}"
+        return f"{s.codec.upper()} NVENC CQ {s.cq} {s.preset}"
 
     @property
     def partial_output(self) -> Path:
@@ -330,8 +354,8 @@ class Plan:
             f"  Each clip   : {ref.duration:.4f} s -> {self.segment:.4f} s ({self.bars} bars), "
             f"speed x{self.speed:.4f} ({(self.speed - 1) * 100:+.2f}%)",
             f"  Output      : {s.width}x{s.height} @ {float(self.out_fps):g} fps, "
-            f"~{self.segment * float(self.out_fps):.2f} frames per clip, {s.codec.upper()} NVENC "
-            f"CQ {s.cq} {s.preset} + AAC {s.audio_bitrate}",
+            f"~{self.segment * float(self.out_fps):.2f} frames per clip, {self.encoder_label()} "
+            f"+ AAC {s.audio_bitrate}",
             f"  Sequence    : {len(self.playlist)} clip plays ({len(self.playlist) / len(self.inputs.clips):.1f} "
             f"loops of {len(self.inputs.clips)}), cut to {fmt_time(self.target_dur)}"
             + (f", {self.fade:g} s fade to black" + (" + audio fade" if s.audio_fade else "")
@@ -403,10 +427,14 @@ class Plan:
             vf = f"{base},{fade_f}format=yuv420p[v]"
 
         gop = str(max(1, round(float(self.out_fps) * 2)))   # keyframe every 2 s
-        venc = ["-c:v", self.encoder, "-preset", s.preset, "-tune", "hq",
-                "-rc", "vbr", "-cq", str(s.cq), "-b:v", "0",
-                "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32",
-                "-bf", "3", "-g", gop]
+        if s.cpu_encode:
+            venc = ["-c:v", self.encoder, "-preset", self.cpu_preset, "-crf", str(s.cq),
+                    "-bf", "3", "-g", gop]
+        else:
+            venc = ["-c:v", self.encoder, "-preset", s.preset, "-tune", "hq",
+                    "-rc", "vbr", "-cq", str(s.cq), "-b:v", "0",
+                    "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32",
+                    "-bf", "3", "-g", gop]
         venc += ["-profile:v", "high"] if s.codec == "h264" else ["-profile:v", "main", "-tag:v", "hvc1"]
 
         audio_chain = list(self.audio_chain)
@@ -550,6 +578,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--audio-bitrate", default="320k", help="AAC bitrate")
     ap.add_argument("--cpu-decode", action="store_true",
                     help="decode and scale on the CPU (encoding still uses NVENC)")
+    ap.add_argument("--cpu-encode", action="store_true",
+                    help="encode with libx264/libx265 instead of NVENC, for machines without an "
+                         "NVIDIA GPU (use with --cpu-decode; --cq becomes the CRF, p1-p7 map to "
+                         "x264 presets ultrafast-slow)")
     ap.add_argument("--preview", type=float, metavar="SECONDS",
                     help="render only the first SECONDS (quick test of sync and quality)")
     ov = ap.add_argument_group("logo overlay (e.g. a transparent subscribe.png over the intro)")
@@ -609,7 +641,7 @@ def main() -> int:
                 raise RenderError("Not overwriting (use -y to force).")
         plan.output.parent.mkdir(parents=True, exist_ok=True)
 
-        check_nvenc(plan.encoder)
+        check_encoder(plan.encoder)
         print(f"\nRendering -> {plan.output}\n")
         code = run_ffmpeg(plan.command(list_file, plan.partial_output), plan.target_dur)
         finish_output(plan, code == 0)
