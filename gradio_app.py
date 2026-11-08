@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import gradio as gr
@@ -36,8 +37,15 @@ import make_dance_video as mdv
 HERE = mdv.HERE
 ON_COLAB = "COLAB_RELEASE_TAG" in os.environ or Path("/content").is_dir()
 DEFAULT_LOGO = HERE / "subscribe.png"
-DRIVE_ROOT = Path("/content/drive/MyDrive/VisualSync")
+DRIVE_MOUNT = Path("/content/drive")
+DRIVE_ROOT = DRIVE_MOUNT / "MyDrive/VisualSync"
 STAGE_ROOT = Path(tempfile.gettempdir()) / "visualsync_uploads"
+# Local-disk working area on Colab: renders and cached copies of Drive clips.
+LOCAL_ROOT = Path("/content/visualsync_local") if ON_COLAB else Path(tempfile.gettempdir()) / "visualsync_local"
+RENDER_DIR = LOCAL_ROOT / "render"
+CLIP_CACHE = LOCAL_ROOT / "clips"
+CLIP_CACHE_MAX = 20e9              # don't cache clip sets bigger than this
+DEFAULT_CQ = {"hevc": 24, "h264": 21}
 
 RESOLUTIONS = [("720p (1280×720)", "1280x720"), ("1080p (1920×1080)", "1920x1080"),
                ("1440p (2560×1440)", "2560x1440"), ("4K (3840×2160)", "3840x2160")]
@@ -201,6 +209,77 @@ def probe(video_dir: Path, audio: Path) -> mdv.Inputs:
 
 
 # --------------------------------------------------------------------------- #
+# Google Drive: keep the heavy I/O on Colab's local disk
+# --------------------------------------------------------------------------- #
+def on_drive(path: Path) -> bool:
+    """True for files on the mounted Google Drive (a slow network filesystem)."""
+    try:
+        return Path(path).resolve().is_relative_to(DRIVE_MOUNT)
+    except OSError:
+        return False
+
+
+def free_bytes(folder: Path) -> float:
+    folder.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(folder).free
+
+
+def use_local_render(plan: mdv.Plan) -> None:
+    """Render a Drive-bound video on local disk; finish_output copies it over at the end.
+
+    ffmpeg's +faststart rewrites the whole file once encoding is done (to move the
+    index to the front), which is slow on the Drive mount. Skipped if the local disk
+    is short of space (estimate: 20 Mbit/s for the whole video, plus 2 GB headroom).
+    """
+    if not on_drive(plan.output):
+        return
+    try:
+        if free_bytes(RENDER_DIR) > plan.target_dur * 2.5e6 + 2e9:
+            plan.work_dir = RENDER_DIR
+    except OSError:
+        pass
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def cache_drive_clips(plan: mdv.Plan) -> int:
+    """Copy the dancer clips from Drive to local disk once, and point the plan at them.
+
+    The concat list re-opens every clip many times over a long mix; reading local
+    copies avoids Drive latency on each one. Copies are reused by later renders
+    (keyed on path, size and modification time). Returns how many clips were copied.
+    """
+    clips = [c.path for c in plan.inputs.clips if on_drive(c.path)]
+    if not clips:
+        return 0
+    try:
+        stats = {p: p.stat() for p in clips}
+        total = sum(st.st_size for st in stats.values())
+        if total > CLIP_CACHE_MAX or free_bytes(CLIP_CACHE) < total + 5e9:
+            return 0
+    except OSError:
+        return 0
+
+    mapping: dict[Path, Path] = {}
+    todo: list[tuple[Path, Path]] = []
+    for p, st in stats.items():
+        key = hashlib.sha1(f"{p.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()[:16]
+        dst = CLIP_CACHE / f"{key}{p.suffix.lower()}"
+        mapping[p] = dst
+        if not (dst.is_file() and dst.stat().st_size == st.st_size):
+            todo.append((p, dst))
+    if todo:
+        with ThreadPoolExecutor(max_workers=8) as pool:   # Drive reads are latency-bound
+            list(pool.map(lambda job: _copy_atomic(*job), todo))
+    plan.playlist = [mapping.get(p, p) for p in plan.playlist]
+    return len(todo)
+
+
+# --------------------------------------------------------------------------- #
 # Settings -> plan
 # --------------------------------------------------------------------------- #
 FIELDS = ["mode", "clip_files", "mix_file", "clips_dir", "mix_path", "output_dir",
@@ -253,14 +332,14 @@ def make_plan(vals: tuple, preview: bool) -> tuple[mdv.Plan, dict]:
         fade=num(v["fade"], 4.0),
         audio_fade=bool(v["audio_fade"]),
         codec=v["codec"],
-        cq=int(num(v["cq"], 19)),
+        cq=int(num(v["cq"], DEFAULT_CQ.get(v["codec"], 24))),
         preset=v["preset"],
         audio_bitrate=v["audio_bitrate"],
         cpu_decode=cpu_decode,
         cpu_encode=cpu_encode,
         preview=max(1.0, num(v["preview_len"], 30)) if preview else None,
         overlay=overlay,
-        overlay_size=num(v["overlay_size"], 50),
+        overlay_size=num(v["overlay_size"], 70),
         overlay_start=num(v["overlay_start"], 1.0),
         overlay_duration=num(v["overlay_duration"], 5.0),
         overlay_fade_in=num(v["overlay_fade_in"], 0.5),
@@ -270,6 +349,7 @@ def make_plan(vals: tuple, preview: bool) -> tuple[mdv.Plan, dict]:
     out_dir = (v["output_dir"] or "").strip()
     if out_dir:
         plan.output = Path(out_dir).expanduser() / plan.output.name
+    use_local_render(plan)
     return plan, hw
 
 
@@ -277,7 +357,10 @@ def plan_text(plan: mdv.Plan) -> str:
     s = plan.settings
     where = (f"  Processing  : decode+scale on {'CPU' if s.cpu_decode else 'GPU'}, "
              f"encode on {'CPU' if s.cpu_encode else 'GPU (NVENC)'}")
-    return "\n".join([plan.inputs.describe(), "", *plan.summary(), where])
+    lines = [plan.inputs.describe(), "", *plan.summary(), where]
+    if plan.work_dir:
+        lines.append("  Rendered on : Colab's local disk, then copied to Drive")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -338,16 +421,27 @@ def _render(preview: bool, vals: tuple):
         yield status_html("Checking the encoder…", 0), summary, "", *nothing
         try:
             plan.output.parent.mkdir(parents=True, exist_ok=True)
-            mdv.check_encoder(plan.encoder)
+            if plan.work_dir:
+                plan.work_dir.mkdir(parents=True, exist_ok=True)
+            note = mdv.check_plan_encoder(plan)
         except (mdv.RenderError, OSError) as exc:
             yield status_html(str(exc), kind="error"), summary, "", *nothing
             return
+
+        if any(on_drive(c.path) for c in plan.inputs.clips):
+            yield status_html("Copying the clips from Google Drive to local disk "
+                              "(once; later renders reuse them)…", 0), summary, "", *nothing
+            try:
+                cache_drive_clips(plan)
+            except OSError as exc:   # not fatal: read them from Drive instead
+                note = ((note or "") + f"\nCouldn't cache the clips locally ({exc}); "
+                        "reading them from Drive.").strip()
 
         with tempfile.TemporaryDirectory(prefix="dancesync_") as tmp:
             list_file = Path(tmp) / "clips.txt"
             list_file.write_text(plan.concat_text(), encoding="utf-8")
             cmd = plan.command(list_file, plan.partial_output)
-            log = subprocess.list2cmdline(cmd) + "\n"
+            log = (note + "\n\n" if note else "") + subprocess.list2cmdline(cmd) + "\n"
             err_path = Path(tmp) / "ffmpeg_stderr.txt"
             total = plan.target_dur
             kind = f"preview ({total:g} s)" if preview else "full video"
@@ -388,7 +482,16 @@ def _render(preview: bool, vals: tuple):
                 log += "\n" + err_text
             cancelled = JOB.get("cancel", False)
             ok = code == 0 and not cancelled
-            mdv.finish_output(plan, ok)
+            if ok and plan.work_dir:
+                yield status_html(f"Copying {plan.output.name} to Google Drive…", 100), \
+                    summary, log, *nothing
+            try:
+                mdv.finish_output(plan, ok)
+            except OSError as exc:
+                yield status_html(f"Rendered, but copying to {plan.output.parent} failed ({exc}).\n"
+                                  f"The video is still on Colab's disk: {plan.partial_output}",
+                                  kind="error"), summary, log, *nothing
+                return
             elapsed = hms(time.monotonic() - t0)
             if cancelled:
                 yield status_html("Stopped. The unfinished file was removed.", kind="error"), \
@@ -491,9 +594,12 @@ def build_ui() -> gr.Blocks:
             with gr.Column():
                 gr.Markdown("### Video & audio")
                 resolution = gr.Dropdown(RESOLUTIONS, value="1920x1080", label="Resolution")
-                codec = gr.Dropdown(CODECS, value="h264", label="Codec")
-                cq = gr.Slider(10, 40, value=19, step=1,
-                               label="Quality (NVENC CQ / CPU CRF) – lower = better, bigger")
+                # HEVC when the GPU encodes it; on the CPU, x265 is far slower than x264.
+                default_codec = "hevc" if hw["hevc_nvenc"] else "h264"
+                codec = gr.Dropdown(CODECS, value=default_codec, label="Codec")
+                cq = gr.Slider(10, 40, value=DEFAULT_CQ[default_codec], step=1,
+                               label="Quality (NVENC CQ / CPU CRF) – lower = better, bigger",
+                               info="For YouTube: 24 with HEVC, 21 with H.264. Each step ≈ 10% size.")
                 preset = gr.Dropdown(PRESETS, value="p7" if has_nvenc else "p4",
                                      label="Preset (on CPU: p1-p7 = x264 ultrafast-slow)")
                 audio_bitrate = gr.Dropdown(AUDIO_BITRATES, value="320k", label="Audio (AAC)")
@@ -512,7 +618,7 @@ def build_ui() -> gr.Blocks:
                                    type="filepath", image_mode=None, format="png",
                                    label="Image (transparent PNG)", height=160)
                 with gr.Column():
-                    overlay_size = gr.Slider(5, 100, value=50, step=1, label="Width (% of video)")
+                    overlay_size = gr.Slider(5, 100, value=70, step=1, label="Width (% of video)")
                     overlay_start = gr.Number(value=1.0, minimum=0, label="Appears at (s)")
                     overlay_duration = gr.Number(value=5.0, minimum=0.5,
                                                  label="On screen for (s, including fades)")
@@ -554,6 +660,9 @@ def build_ui() -> gr.Blocks:
                                       gr.update(interactive=on)),
                        [retempo, bpm], [target_bpm, stretch])
         bpm.change(lambda b, on: gr.skip() if on else b, [bpm, retempo], target_bpm)
+        # Switching codec moves the quality to that codec's default, unless it was customised.
+        codec.change(lambda c, q: DEFAULT_CQ[c] if q in DEFAULT_CQ.values() else gr.skip(),
+                     [codec, cq], cq)
 
         plan_btn.click(check_plan, inputs, [status, plan_box])
         preview_btn.click(render_preview, inputs, outputs)

@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         self.cq_spin = QSpinBox()
         self.cq_spin.setRange(10, 40)
         self.cq_spin.setToolTip("NVENC constant quality. Lower = better quality and bigger file.\n"
-                                "17–21 is visually transparent for most footage.")
+                                "For YouTube uploads: about 24 with HEVC, 21 with H.264.")
         self.preset_combo = combo(PRESETS)
         self.abr_combo = combo(AUDIO_BITRATES)
         self.fade_spin = dspin(0, 30, 1, 0.5, " s")
@@ -344,8 +344,8 @@ class MainWindow(QMainWindow):
         self.offset_spin.setValue(float(st.value("offset", 0.0)))
         set_combo(self.res_combo, "1920x1080")
         set_combo(self.res_combo, st.value("resolution", "1920x1080"))
-        set_combo(self.codec_combo, st.value("codec", "h264"))
-        self.cq_spin.setValue(int(st.value("cq", 19)))
+        set_combo(self.codec_combo, st.value("codec", "hevc"))
+        self.cq_spin.setValue(int(st.value("cq", 24)))
         set_combo(self.preset_combo, st.value("preset", "p7"))
         set_combo(self.abr_combo, st.value("audio_bitrate", "320k"))
         self.fade_spin.setValue(float(st.value("fade", 4.0)))
@@ -355,7 +355,7 @@ class MainWindow(QMainWindow):
         default_logo = HERE / "subscribe.png"
         self.overlay_box.setChecked(st.value("overlay_enabled", default_logo.is_file(), type=bool))
         self.overlay_edit.setText(st.value("overlay", str(default_logo) if default_logo.is_file() else ""))
-        self.overlay_size_spin.setValue(float(st.value("overlay_size", 50.0)))
+        self.overlay_size_spin.setValue(float(st.value("overlay_size", 70.0)))
         self.overlay_start_spin.setValue(float(st.value("overlay_start", 1.0)))
         self.overlay_dur_spin.setValue(float(st.value("overlay_duration", 5.0)))
         self.overlay_fin_spin.setValue(float(st.value("overlay_fade_in", 0.5)))
@@ -552,7 +552,7 @@ class MainWindow(QMainWindow):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            mdv.check_nvenc(plan.encoder)
+            note = mdv.check_plan_encoder(plan)
         except mdv.RenderError as exc:
             QMessageBox.critical(self, APP_NAME, str(exc))
             return
@@ -565,7 +565,7 @@ class MainWindow(QMainWindow):
         cmd = plan.command(list_file, plan.partial_output)
         cmd[0] = shutil.which("ffmpeg") or "ffmpeg"
 
-        self.log_view.setPlainText(subprocess.list2cmdline(cmd) + "\n")
+        self.log_view.setPlainText((note + "\n\n" if note else "") + subprocess.list2cmdline(cmd) + "\n")
         self.job_plan = plan
         self.cancelled = False
         self.stdout_buf = b""

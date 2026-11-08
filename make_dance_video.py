@@ -220,19 +220,44 @@ def check_bpm(value: float, what: str) -> None:
         raise RenderError(f"{what} {value:g} looks wrong (expected roughly 122-126)")
 
 
-def check_encoder(encoder: str) -> None:
-    """Fail early with a clear message if the video encoder can't actually open."""
+def _encoder_error(encoder: str, args: list[str] | None = None) -> str | None:
+    """Encode a few black frames with these options; return ffmpeg's error, or None if it works."""
+    args = args or ["-c:v", encoder]
     proc = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-         "color=c=black:s=1280x720:r=24:d=0.2", "-c:v", encoder, "-f", "null", "-"],
+         "color=c=black:s=1280x720:r=24:d=0.5", *args, "-f", "null", "-"],
         capture_output=True, text=True, creationflags=NO_WINDOW)
-    if proc.returncode != 0:
+    return None if proc.returncode == 0 else (proc.stderr.strip() or f"exit code {proc.returncode}")
+
+
+def check_encoder(encoder: str, args: list[str] | None = None) -> None:
+    """Fail early with a clear message if the video encoder can't actually open."""
+    error = _encoder_error(encoder, args)
+    if error:
         hint = ("Update the NVIDIA driver, close other apps using NVENC, or use CPU encoding."
                 if "nvenc" in encoder else "This ffmpeg build doesn't include that encoder.")
-        raise RenderError(f"{encoder} is not usable on this machine:\n{proc.stderr.strip()}\n{hint}")
+        raise RenderError(f"{encoder} is not usable on this machine:\n{error}\n{hint}")
 
 
-check_nvenc = check_encoder   # older name, still used by gui.py
+check_nvenc = check_encoder   # older name
+
+
+def check_plan_encoder(plan: "Plan") -> str | None:
+    """Make sure the plan's exact encoder options work here.
+
+    Older GPUs/drivers lack two-pass or B-frame references; then those are dropped
+    (plan.nvenc_extras = False) and a note is returned. Raises RenderError if even
+    the basic encoder won't open.
+    """
+    if _encoder_error(plan.encoder, plan.video_args()) is None:
+        return None
+    if not plan.settings.cpu_encode and plan.nvenc_extras:
+        plan.nvenc_extras = False
+        if _encoder_error(plan.encoder, plan.video_args()) is None:
+            return ("Note: this GPU/driver doesn't support NVENC two-pass or B-frame references, "
+                    "so they're off for this render (files will be slightly bigger).")
+    check_encoder(plan.encoder, plan.video_args())   # raises with ffmpeg's message
+    return None
 
 # NVENC preset -> closest x264/x265 preset, for CPU encoding.
 CPU_PRESETS = {"p1": "ultrafast", "p2": "superfast", "p3": "veryfast", "p4": "faster",
@@ -256,8 +281,8 @@ class Settings:
     height: int = 1080
     fade: float = 4.0
     audio_fade: bool = False
-    codec: str = "h264"                  # h264 | hevc
-    cq: int = 19
+    codec: str = "hevc"                  # h264 | hevc
+    cq: int = 24                         # HEVC 24 ≈ H.264 21: clean YouTube source, ~half the size of 19
     preset: str = "p7"
     audio_bitrate: str = "320k"
     cpu_decode: bool = False
@@ -265,7 +290,7 @@ class Settings:
     preview: float | None = None         # render only the first N seconds
     output: Path | None = None           # None = ./output/<auto name>.mp4
     overlay: Path | None = None          # transparent image shown centred over the intro
-    overlay_size: float = 50.0           # image width as % of the video width
+    overlay_size: float = 70.0           # image width as % of the video width
     overlay_start: float = 1.0           # seconds into the video
     overlay_duration: float = 5.0        # time on screen, including the fades
     overlay_fade_in: float = 0.5
@@ -292,6 +317,12 @@ class Plan:
     scaled: tuple[int, int]
     audio_chain: list[str]
     output: Path
+    # Render here instead of next to the output, then copy the finished file over
+    # (e.g. local disk on Colab, so +faststart's rewrite doesn't run on Google Drive).
+    work_dir: Path | None = None
+    # Two-pass + B-frame references for NVENC. check_plan_encoder() turns this off
+    # on GPUs/drivers that don't support them.
+    nvenc_extras: bool = True
 
     @property
     def retempo(self) -> bool:
@@ -323,7 +354,30 @@ class Plan:
 
     @property
     def partial_output(self) -> Path:
-        return self.output.with_name(self.output.stem + ".partial" + self.output.suffix)
+        folder = self.work_dir or self.output.parent
+        return folder / (self.output.stem + ".partial" + self.output.suffix)
+
+    def video_args(self) -> list[str]:
+        """Video encoder options (everything after the filtergraph, before the audio)."""
+        s = self.settings
+        gop = str(max(1, round(float(self.out_fps) * 2)))   # keyframe every 2 s (YouTube: short, closed GOPs)
+        if s.cpu_encode:
+            args = ["-c:v", self.encoder, "-preset", self.cpu_preset, "-crf", str(s.cq),
+                    "-bf", "3", "-g", gop]
+        else:
+            # CQ with -b:v 0: pure constant quality, no default bitrate cap.
+            args = ["-c:v", self.encoder, "-preset", s.preset, "-tune", "hq",
+                    "-rc", "vbr", "-cq", str(s.cq), "-b:v", "0",
+                    "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32", "-g", gop]
+            if self.nvenc_extras:
+                # Full-resolution two-pass analysis, and (HEVC) 4 B-frames used as
+                # references: ~5-10% smaller at the same quality, a little slower.
+                args += ["-multipass", "fullres"]
+                args += (["-bf", "4", "-b_ref_mode", "middle"] if s.codec == "hevc" else ["-bf", "3"])
+            else:
+                args += ["-bf", "3"]
+        args += ["-profile:v", "high"] if s.codec == "h264" else ["-profile:v", "main", "-tag:v", "hvc1"]
+        return args
 
     @property
     def overlay_window(self) -> tuple[float, float, float, float] | None:
@@ -389,12 +443,16 @@ class Plan:
             timing += ",trim=start=0"
         timing += f",fps=fps={self.out_fps}:start_time=0"
 
+        ref = self.inputs.ref
         crop = f"crop={s.width}:{s.height}"
         fade_f = (f"fade=t=out:st={self.target_dur - self.fade:.6f}:d={self.fade:.6f}:color=black,"
                   if self.fade else "")
-        if s.cpu_decode:
+        hw_in: list[str] = [] if s.cpu_decode else ["-hwaccel", "cuda"]
+        if (ref.width, ref.height) == (s.width, s.height):
+            # Clips are already the output size: no scaling, no GPU upload/download.
+            base = f"[0:v]{timing}"
+        elif s.cpu_decode:
             base = f"[0:v]{timing},scale={sw}:{sh}:flags=lanczos,{crop}"
-            hw_in: list[str] = []
         else:
             # NVDEC decodes, but hands frames back in system memory; they're uploaded
             # again for scale_cuda. Keeping decoder frames on the GPU would make
@@ -402,7 +460,6 @@ class Plan:
             # differ (new GPU frame pool), which resets N and breaks the timing.
             base = (f"[0:v]{timing},hwupload_cuda,scale_cuda=w={sw}:h={sh}:interp_algo=lanczos,"
                     f"hwdownload,format=nv12,{crop}")
-            hw_in = ["-hwaccel", "cuda"]
 
         overlay_in: list[str] = []
         if self.overlay_window:
@@ -426,16 +483,7 @@ class Plan:
         else:
             vf = f"{base},{fade_f}format=yuv420p[v]"
 
-        gop = str(max(1, round(float(self.out_fps) * 2)))   # keyframe every 2 s
-        if s.cpu_encode:
-            venc = ["-c:v", self.encoder, "-preset", self.cpu_preset, "-crf", str(s.cq),
-                    "-bf", "3", "-g", gop]
-        else:
-            venc = ["-c:v", self.encoder, "-preset", s.preset, "-tune", "hq",
-                    "-rc", "vbr", "-cq", str(s.cq), "-b:v", "0",
-                    "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32",
-                    "-bf", "3", "-g", gop]
-        venc += ["-profile:v", "high"] if s.codec == "h264" else ["-profile:v", "main", "-tag:v", "hvc1"]
+        venc = self.video_args()
 
         audio_chain = list(self.audio_chain)
         if s.audio_fade and self.fade:
@@ -534,11 +582,29 @@ def make_plan(inputs: Inputs, s: Settings, base_dir: Path = HERE) -> Plan:
 
 
 def finish_output(plan: Plan, success: bool) -> None:
-    """Rename the finished .partial file into place, or remove it."""
-    if success:
-        os.replace(plan.partial_output, plan.output)
-    else:
-        plan.partial_output.unlink(missing_ok=True)
+    """Move the finished .partial file into place, or remove it.
+
+    If it was rendered in plan.work_dir (another disk), it's copied next to the
+    output under the .partial name first and renamed once complete, so the output
+    folder never holds a half-copied video. If the copy fails, the local render is
+    kept and the error is raised.
+    """
+    partial = plan.partial_output
+    if not success:
+        partial.unlink(missing_ok=True)
+        return
+    if partial.parent.resolve() == plan.output.parent.resolve():
+        os.replace(partial, plan.output)
+        return
+    plan.output.parent.mkdir(parents=True, exist_ok=True)
+    staging = plan.output.with_name(plan.output.stem + ".partial" + plan.output.suffix)
+    try:
+        shutil.copyfile(partial, staging)
+        os.replace(staging, plan.output)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+    partial.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -572,8 +638,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--fade", type=float, default=4.0, help="fade-to-black length at the end (0 = off)")
     ap.add_argument("--audio-fade", action="store_true", help="also fade the audio out over --fade seconds")
-    ap.add_argument("--codec", choices=["h264", "hevc"], default="h264")
-    ap.add_argument("--cq", type=int, default=19, help="NVENC constant quality (lower = better/bigger)")
+    ap.add_argument("--codec", choices=["h264", "hevc"], default="hevc",
+                    help="hevc = smaller files at the same quality (YouTube accepts both)")
+    ap.add_argument("--cq", type=int, default=24,
+                    help="NVENC constant quality (lower = better/bigger); 24 suits HEVC uploads, "
+                         "use about 21 for H.264")
     ap.add_argument("--preset", default="p7", help="NVENC preset p1 (fastest) .. p7 (best)")
     ap.add_argument("--audio-bitrate", default="320k", help="AAC bitrate")
     ap.add_argument("--cpu-decode", action="store_true",
@@ -587,7 +656,7 @@ def parse_args() -> argparse.Namespace:
     ov = ap.add_argument_group("logo overlay (e.g. a transparent subscribe.png over the intro)")
     ov.add_argument("--overlay", type=Path, metavar="IMAGE",
                     help="transparent image to show centred over the start of the video")
-    ov.add_argument("--overlay-size", type=float, default=50.0, metavar="PERCENT",
+    ov.add_argument("--overlay-size", type=float, default=70.0, metavar="PERCENT",
                     help="image width as a percentage of the video width")
     ov.add_argument("--overlay-start", type=float, default=1.0, metavar="S",
                     help="when the image appears (seconds into the video)")
@@ -641,7 +710,9 @@ def main() -> int:
                 raise RenderError("Not overwriting (use -y to force).")
         plan.output.parent.mkdir(parents=True, exist_ok=True)
 
-        check_encoder(plan.encoder)
+        note = check_plan_encoder(plan)
+        if note:
+            print("\n" + note)
         print(f"\nRendering -> {plan.output}\n")
         code = run_ffmpeg(plan.command(list_file, plan.partial_output), plan.target_dur)
         finish_output(plan, code == 0)
