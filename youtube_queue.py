@@ -33,6 +33,8 @@ SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 SYNC_TIMEOUT = 2 * 3600            # how long to wait for Drive to finish uploading the file
 POLL_EVERY = 20                    # seconds between checks while it syncs
 TITLE_MAX = 100                    # YouTube's limit
+IFTTT_MAX_BYTES = 512e6            # IFTTT's YouTube "Upload video from URL" refuses bigger files
+IFTTT_TARGET_MB = 500              # what VisualSync's "Fit under 512 MB" renders aim for
 
 
 class QueueError(RuntimeError):
@@ -172,6 +174,10 @@ def queue_video(path: Path | str, title: str = "", description: str = "") -> Ite
     path = Path(path).expanduser()
     if not path.is_file():
         raise QueueError(f"File not found: {path}")
+    size = path.stat().st_size
+    if size > IFTTT_MAX_BYTES:
+        raise QueueError(f"{path.name} is {size / 1e6:,.0f} MB; IFTTT only uploads videos up to "
+                         "512 MB. Render it with \"Fit under IFTTT's 512 MB limit\" ticked.")
     drive, sheets = _services()
     sheet_id = queue_sheet_id(drive)       # fail early, before waiting on the sync
 

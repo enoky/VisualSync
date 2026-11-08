@@ -22,7 +22,7 @@ Everything happens in ONE ffmpeg pass, with no intermediate files:
 The render is written to "<name>.partial.mp4" and renamed when it finishes,
 so a cancelled or failed render never leaves a broken file behind.
 
-No NVIDIA GPU? --cpu-decode --cpu-encode does the same on the CPU (libx264/libx265).
+No NVIDIA GPU? --cpu-decode --cpu-encode does the same on the CPU (libx264/libx265/SVT-AV1).
 
 Usage (or use the GUI: run_gui.bat / gui.py, or the web UI: gradio_app.py, e.g. on
 Google Colab via VisualSync_Colab.ipynb):
@@ -262,6 +262,21 @@ def check_plan_encoder(plan: "Plan") -> str | None:
 # NVENC preset -> closest x264/x265 preset, for CPU encoding.
 CPU_PRESETS = {"p1": "ultrafast", "p2": "superfast", "p3": "veryfast", "p4": "faster",
                "p5": "fast", "p6": "medium", "p7": "slow"}
+# ... and -> SVT-AV1 preset (0 = slowest/best .. 13 = fastest).
+SVTAV1_PRESETS = {"p1": "12", "p2": "11", "p3": "10", "p4": "9", "p5": "8", "p6": "7", "p7": "6"}
+CPU_ENCODERS = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
+
+# --target-size: aim this far under the limit, since one-pass bitrate control drifts a little.
+SIZE_MARGIN = 0.95
+MIN_VIDEO_KBPS = 250            # below this the picture falls apart; refuse instead
+SIZE_MODE_MAX_AUDIO_KBPS = 160  # in --target-size mode, spend the bytes on the picture
+
+
+def kbps(bitrate: str) -> float:
+    """'320k' -> 320.0, '1.5M' -> 1500.0, '128000' -> 128.0"""
+    text = str(bitrate).strip().lower()
+    scale = {"k": 1.0, "m": 1000.0}.get(text[-1:], None)
+    return float(text[:-1]) * scale if scale else float(text) / 1000
 
 
 # --------------------------------------------------------------------------- #
@@ -281,10 +296,11 @@ class Settings:
     height: int = 1080
     fade: float = 4.0
     audio_fade: bool = False
-    codec: str = "hevc"                  # h264 | hevc
+    codec: str = "hevc"                  # h264 | hevc | av1
     cq: int = 24                         # HEVC 24 ≈ H.264 21: clean YouTube source, ~half the size of 19
     preset: str = "p7"
     audio_bitrate: str = "320k"
+    target_size: float | None = None     # MB (10^6 bytes): set the bitrate so the file fits
     cpu_decode: bool = False
     cpu_encode: bool = False             # libx264/libx265 instead of NVENC (no NVIDIA GPU)
     preview: float | None = None         # render only the first N seconds
@@ -339,18 +355,38 @@ class Plan:
     @property
     def encoder(self) -> str:
         if self.settings.cpu_encode:
-            return "libx265" if self.settings.codec == "hevc" else "libx264"
+            return CPU_ENCODERS[self.settings.codec]
         return f"{self.settings.codec}_nvenc"
 
     @property
     def cpu_preset(self) -> str:
-        return CPU_PRESETS.get(self.settings.preset, self.settings.preset)
+        table = SVTAV1_PRESETS if self.settings.codec == "av1" else CPU_PRESETS
+        return table.get(self.settings.preset, self.settings.preset)
+
+    @property
+    def audio_kbps(self) -> float:
+        a = kbps(self.settings.audio_bitrate)
+        return min(a, SIZE_MODE_MAX_AUDIO_KBPS) if self.settings.target_size else a
+
+    @property
+    def video_kbps(self) -> float | None:
+        """Average video bitrate for --target-size, from the FULL length (so a preview
+        shows the real quality), or None for constant-quality mode."""
+        s = self.settings
+        if not s.target_size:
+            return None
+        total = s.target_size * 1e6 * 8 * SIZE_MARGIN / self.mix_dur / 1000
+        return total - self.audio_kbps
 
     def encoder_label(self) -> str:
         s = self.settings
-        if s.cpu_encode:
-            return f"{s.codec.upper()} {self.encoder} (CPU) CRF {s.cq} {self.cpu_preset}"
-        return f"{s.codec.upper()} NVENC CQ {s.cq} {s.preset}"
+        where = f"{self.encoder} (CPU)" if s.cpu_encode else "NVENC"
+        preset = self.cpu_preset if s.cpu_encode else s.preset
+        if self.video_kbps is not None:
+            rate = f"{self.video_kbps:,.0f} kbps (fits {s.target_size:g} MB)"
+        else:
+            rate = f"{'CRF' if s.cpu_encode else 'CQ'} {s.cq}"
+        return f"{s.codec.upper()} {where} {rate} {preset}"
 
     @property
     def partial_output(self) -> Path:
@@ -361,22 +397,40 @@ class Plan:
         """Video encoder options (everything after the filtergraph, before the audio)."""
         s = self.settings
         gop = str(max(1, round(float(self.out_fps) * 2)))   # keyframe every 2 s (YouTube: short, closed GOPs)
+        vk = self.video_kbps
+        # Size mode: average bitrate, with peaks allowed for busy scenes.
+        rate = ([] if vk is None else
+                ["-b:v", f"{vk:.0f}k", "-maxrate", f"{vk * 2:.0f}k", "-bufsize", f"{vk * 4:.0f}k"])
         if s.cpu_encode:
-            args = ["-c:v", self.encoder, "-preset", self.cpu_preset, "-crf", str(s.cq),
-                    "-bf", "3", "-g", gop]
+            if s.codec == "av1":   # SVT-AV1: plain average bitrate (no VBV), picks its own B-frames
+                quality = ["-crf", str(s.cq)] if vk is None else ["-b:v", f"{vk:.0f}k"]
+                args = ["-c:v", self.encoder, "-preset", self.cpu_preset, *quality, "-g", gop]
+            else:
+                args = ["-c:v", self.encoder, "-preset", self.cpu_preset,
+                        *(rate or ["-crf", str(s.cq)]), "-bf", "3", "-g", gop]
         else:
-            # CQ with -b:v 0: pure constant quality, no default bitrate cap.
-            args = ["-c:v", self.encoder, "-preset", s.preset, "-tune", "hq",
-                    "-rc", "vbr", "-cq", str(s.cq), "-b:v", "0",
-                    "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32", "-g", gop]
+            # Default: CQ with -b:v 0 = pure constant quality, no bitrate cap.
+            args = ["-c:v", self.encoder, "-preset", s.preset, "-tune", "hq", "-rc", "vbr",
+                    *(rate or ["-cq", str(s.cq), "-b:v", "0"]),
+                    "-spatial-aq", "1", "-rc-lookahead", "32", "-g", gop]
+            if s.codec != "av1":
+                args += ["-temporal-aq", "1"]
             if self.nvenc_extras:
-                # Full-resolution two-pass analysis, and (HEVC) 4 B-frames used as
+                # Full-resolution two-pass analysis, and (HEVC/AV1) 4 B-frames used as
                 # references: ~5-10% smaller at the same quality, a little slower.
                 args += ["-multipass", "fullres"]
-                args += (["-bf", "4", "-b_ref_mode", "middle"] if s.codec == "hevc" else ["-bf", "3"])
+                if s.codec == "h264":
+                    args += ["-bf", "3"]
+                else:
+                    args += ["-bf", "4", "-b_ref_mode", "middle"]
+                if s.codec == "av1":
+                    args += ["-temporal-aq", "1"]
             else:
                 args += ["-bf", "3"]
-        args += ["-profile:v", "high"] if s.codec == "h264" else ["-profile:v", "main", "-tag:v", "hvc1"]
+        if s.codec == "h264":
+            args += ["-profile:v", "high"]
+        elif s.codec == "hevc":
+            args += ["-profile:v", "main", "-tag:v", "hvc1"]
         return args
 
     @property
@@ -409,7 +463,7 @@ class Plan:
             f"speed x{self.speed:.4f} ({(self.speed - 1) * 100:+.2f}%)",
             f"  Output      : {s.width}x{s.height} @ {float(self.out_fps):g} fps, "
             f"~{self.segment * float(self.out_fps):.2f} frames per clip, {self.encoder_label()} "
-            f"+ AAC {s.audio_bitrate}",
+            f"+ AAC {self.audio_kbps:g}k",
             f"  Sequence    : {len(self.playlist)} clip plays ({len(self.playlist) / len(self.inputs.clips):.1f} "
             f"loops of {len(self.inputs.clips)}), cut to {fmt_time(self.target_dur)}"
             + (f", {self.fade:g} s fade to black" + (" + audio fade" if s.audio_fade else "")
@@ -489,7 +543,7 @@ class Plan:
         if s.audio_fade and self.fade:
             audio_chain.append(f"afade=t=out:st={self.target_dur - self.fade:.6f}:d={self.fade:.6f}")
         # -af runs as its own filtergraph (own thread), so rubberband doesn't slow the video.
-        aenc = ["-c:a", "aac", "-b:a", s.audio_bitrate, "-ar", "48000"]
+        aenc = ["-c:a", "aac", "-b:a", f"{self.audio_kbps:g}k", "-ar", "48000"]
         if audio_chain:
             aenc += ["-af", ",".join(audio_chain)]
 
@@ -571,8 +625,23 @@ def make_plan(inputs: Inputs, s: Settings, base_dir: Path = HERE) -> Plan:
         output = base_dir / "output" / f"{inputs.audio.stem}_{tempo}.mp4"
     else:
         output = Path(s.output).with_suffix(".mp4")
+    if s.target_size:   # keep the full-quality render alongside
+        output = output.with_name(f"{output.stem}_{s.target_size:g}MB.mp4")
     if s.preview:   # never let a preview overwrite the real render
         output = output.with_name(f"{output.stem}_preview{int(target_dur)}s.mp4")
+
+    if s.codec not in CPU_ENCODERS:
+        raise RenderError(f"Unknown codec {s.codec!r} (use h264, hevc or av1)")
+    if s.target_size is not None:
+        if s.target_size <= 0:
+            raise RenderError("Target size must be more than 0 MB")
+        audio = min(kbps(s.audio_bitrate), SIZE_MODE_MAX_AUDIO_KBPS)
+        video = s.target_size * 1e6 * 8 * SIZE_MARGIN / mix_dur / 1000 - audio
+        if video < MIN_VIDEO_KBPS:
+            longest = s.target_size * 1e6 * 8 * SIZE_MARGIN / ((MIN_VIDEO_KBPS + audio) * 1000)
+            raise RenderError(f"{fmt_time(mix_dur)} won't fit in {s.target_size:g} MB at a watchable "
+                              f"quality (only {max(video, 0):.0f} kbps for the picture). "
+                              f"Mixes up to about {fmt_time(longest)} fit.")
 
     return Plan(inputs=inputs, settings=s, src_bpm=src_bpm, bpm=target_bpm, ratio=ratio,
                 mix_dur=mix_dur, target_dur=target_dur, fade=fade, bar=bar, bars=bars,
@@ -638,13 +707,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--fade", type=float, default=4.0, help="fade-to-black length at the end (0 = off)")
     ap.add_argument("--audio-fade", action="store_true", help="also fade the audio out over --fade seconds")
-    ap.add_argument("--codec", choices=["h264", "hevc"], default="hevc",
-                    help="hevc = smaller files at the same quality (YouTube accepts both)")
+    ap.add_argument("--codec", choices=["h264", "hevc", "av1"], default="hevc",
+                    help="hevc = smaller files at the same quality (YouTube accepts both); "
+                         "av1 = smaller still (NVENC AV1 needs an RTX 40 / L4-class GPU and ffmpeg 6+)")
     ap.add_argument("--cq", type=int, default=24,
                     help="NVENC constant quality (lower = better/bigger); 24 suits HEVC uploads, "
                          "use about 21 for H.264")
     ap.add_argument("--preset", default="p7", help="NVENC preset p1 (fastest) .. p7 (best)")
     ap.add_argument("--audio-bitrate", default="320k", help="AAC bitrate")
+    ap.add_argument("--target-size", type=float, metavar="MB",
+                    help="size the bitrate so the whole video fits in MB megabytes (e.g. 500 for "
+                         "IFTTT's 512 MB limit; audio is capped at 160k); --cq is ignored")
     ap.add_argument("--cpu-decode", action="store_true",
                     help="decode and scale on the CPU (encoding still uses NVENC)")
     ap.add_argument("--cpu-encode", action="store_true",

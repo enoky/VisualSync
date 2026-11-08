@@ -19,12 +19,14 @@ Big videos can't go to YouTube straight from a Google Drive share link (Drive sh
 
 The video is shared as "anyone with the link" and a direct-download link is added to the sheet; IFTTT then uploads it (about hourly on its free plan).
 
+IFTTT only uploads files up to **512 MB**, so tick **Fit under IFTTT's 512 MB limit** in the app. It sets the bitrate from the mix's length (an hour-long mix gets about 900 kbps of video plus 160 kbps audio) and saves the result as `…_500MB.mp4`, next to any full-quality render. Use an **L4** runtime: cell 1 then installs a newer ffmpeg and the app encodes **AV1**, which looks noticeably better than HEVC at that bitrate. On a T4 it falls back to HEVC.
+
 ## Run it on your own computer
 
 | Interface | Start it with |
 | --- | --- |
 | Desktop app (Windows) | `run_gui.bat` |
 | Web app (any OS) | `pip install -r requirements.txt gradio` then `python gradio_app.py` |
-| Command line | `python make_dance_video.py --bpm 124` (see `--help`) |
+| Command line | `python make_dance_video.py --bpm 124` (see `--help`; `--codec av1 --target-size 500` for a file under 512 MB) |
 
 All three need `ffmpeg` and `ffprobe` on the PATH. They use an NVIDIA GPU (NVDEC + NVENC) by default. Without one, tick CPU in the web app (it picks it automatically) or pass `--cpu-decode --cpu-encode` on the command line.

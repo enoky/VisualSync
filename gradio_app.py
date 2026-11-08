@@ -46,11 +46,12 @@ LOCAL_ROOT = Path("/content/visualsync_local") if ON_COLAB else Path(tempfile.ge
 RENDER_DIR = LOCAL_ROOT / "render"
 CLIP_CACHE = LOCAL_ROOT / "clips"
 CLIP_CACHE_MAX = 20e9              # don't cache clip sets bigger than this
-DEFAULT_CQ = {"hevc": 24, "h264": 21}
+DEFAULT_CQ = {"hevc": 24, "h264": 21, "av1": 32}
 
 RESOLUTIONS = [("720p (1280×720)", "1280x720"), ("1080p (1920×1080)", "1920x1080"),
                ("1440p (2560×1440)", "2560x1440"), ("4K (3840×2160)", "3840x2160")]
-CODECS = [("H.264 – most compatible", "h264"), ("HEVC / H.265 – smaller files", "hevc")]
+CODECS = [("H.264 – most compatible", "h264"), ("HEVC / H.265 – smaller files", "hevc"),
+          ("AV1 – smallest files (L4 GPU)", "av1")]
 STRETCHES = [("Keylock – keep original pitch", "keylock"),
              ("Varispeed – pitch follows tempo", "varispeed")]
 PRESETS = [(f"p{i}" + {7: " – best quality", 4: " – balanced", 1: " – fastest"}.get(i, ""), f"p{i}")
@@ -87,7 +88,8 @@ def detect_hardware() -> dict:
         return _hw
     hw = {"ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")), "gpu": "",
           "version": "", "rubberband": False, "soxr": False, "cuda_scale": False,
-          "h264_nvenc": False, "hevc_nvenc": False, "libx264": False, "libx265": False}
+          "h264_nvenc": False, "hevc_nvenc": False, "av1_nvenc": False,
+          "libx264": False, "libx265": False, "libsvtav1": False}
     if not hw["ffmpeg"]:
         _hw = hw
         return hw
@@ -105,7 +107,7 @@ def detect_hardware() -> dict:
     except (OSError, IndexError):
         pass
     video = ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=24:d=0.2"]
-    for enc in ("h264_nvenc", "hevc_nvenc", "libx264", "libx265"):
+    for enc in ("h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264", "libx265", "libsvtav1"):
         hw[enc] = _ffmpeg_ok([*video, "-c:v", enc, "-f", "null", "-"])
     # The exact GPU scaling chain make_dance_video uses (needs ffmpeg 5+ for interp_algo).
     hw["cuda_scale"] = bool(hw["gpu"]) and _ffmpeg_ok(
@@ -126,8 +128,10 @@ def hardware_markdown(hw: dict) -> str:
     gpu = hw["gpu"] or "none"
     lines = [f"**GPU:** {gpu} · **ffmpeg:** {hw['version'].replace('ffmpeg version ', '')[:40]}",
              f"{yes(hw['h264_nvenc'])} NVENC H.264 · {yes(hw['hevc_nvenc'])} NVENC HEVC · "
+             f"{yes(hw['av1_nvenc'])} NVENC AV1 · "
              f"{yes(hw['cuda_scale'])} GPU scaling · {yes(hw['libx264'])} CPU H.264 · "
-             f"{yes(hw['libx265'])} CPU HEVC · {yes(hw['rubberband'])} keylock (rubberband)"]
+             f"{yes(hw['libx265'])} CPU HEVC · {yes(hw['libsvtav1'])} CPU AV1 · "
+             f"{yes(hw['rubberband'])} keylock (rubberband)"]
     if hw["gpu"] and not hw["h264_nvenc"]:
         lines.append("ℹ️ This GPU can't encode video (A100/H100 have no NVENC). "
                      "Auto uses the CPU — for speed, pick a **T4** or **L4** runtime.")
@@ -289,7 +293,7 @@ FIELDS = ["mode", "clip_files", "mix_file", "clips_dir", "mix_path", "output_dir
           "resolution", "codec", "cq", "preset", "audio_bitrate", "fade", "audio_fade", "fps",
           "encode", "decode",
           "overlay_on", "overlay", "overlay_size", "overlay_start", "overlay_duration",
-          "overlay_fade_in", "overlay_fade_out", "preview_len"]
+          "overlay_fade_in", "overlay_fade_out", "preview_len", "fit_ifttt"]
 
 
 def num(value, default: float = 0.0) -> float:
@@ -318,8 +322,10 @@ def make_plan(vals: tuple, preview: bool) -> tuple[mdv.Plan, dict]:
             raise mdv.RenderError("Choose a logo image, or untick the logo overlay.")
         overlay = _file_path(v["overlay"])
     cpu_encode, cpu_decode = resolve_hw(v["encode"], v["decode"], v["codec"], hw)
-    if cpu_encode and not hw["libx265" if v["codec"] == "hevc" else "libx264"]:
-        raise mdv.RenderError("This ffmpeg has no CPU encoder for that codec. Try H.264.")
+    if cpu_encode and not hw[mdv.CPU_ENCODERS[v["codec"]]]:
+        raise mdv.RenderError("This ffmpeg has no CPU encoder for that codec. Try H.264."
+                              + (" (AV1 on the GPU needs an L4 runtime; run cell 1 again on one.)"
+                                 if v["codec"] == "av1" else ""))
     width, height = (int(x) for x in v["resolution"].split("x"))
 
     settings = mdv.Settings(
@@ -337,6 +343,7 @@ def make_plan(vals: tuple, preview: bool) -> tuple[mdv.Plan, dict]:
         cq=int(num(v["cq"], DEFAULT_CQ.get(v["codec"], 24))),
         preset=v["preset"],
         audio_bitrate=v["audio_bitrate"],
+        target_size=ytq.IFTTT_TARGET_MB if v["fit_ifttt"] else None,
         cpu_decode=cpu_decode,
         cpu_encode=cpu_encode,
         preview=max(1.0, num(v["preview_len"], 30)) if preview else None,
@@ -639,6 +646,12 @@ def build_ui() -> gr.Blocks:
                 preset = gr.Dropdown(PRESETS, value="p7" if has_nvenc else "p4",
                                      label="Preset (on CPU: p1-p7 = x264 ultrafast-slow)")
                 audio_bitrate = gr.Dropdown(AUDIO_BITRATES, value="320k", label="Audio (AAC)")
+                fit_ifttt = gr.Checkbox(
+                    value=False, label="Fit under IFTTT's 512 MB limit (for Send to YouTube)",
+                    info=f"Sets the bitrate from the mix's length so the file is about "
+                         f"{ytq.IFTTT_TARGET_MB * mdv.SIZE_MARGIN:.0f} MB; Quality is ignored and "
+                         "audio is capped at 160 kbps. Best with AV1 (L4 GPU). "
+                         "Saved as …_500MB.mp4, next to any full-quality render.")
                 fps = gr.Number(value=0, minimum=0, label="Frame rate (0 = same as the clips)")
                 with gr.Row():
                     fade = gr.Number(value=4.0, minimum=0, label="Fade to black (s)")
@@ -700,7 +713,7 @@ def build_ui() -> gr.Blocks:
                   resolution, codec, cq, preset, audio_bitrate, fade, audio_fade, fps,
                   encode, decode,
                   overlay_on, overlay, overlay_size, overlay_start, overlay_duration,
-                  overlay_fade_in, overlay_fade_out, preview_len]
+                  overlay_fade_in, overlay_fade_out, preview_len, fit_ifttt]
         assert len(inputs) == len(FIELDS)
         outputs = [status, plan_box, log_box, video_out, file_out]
 
@@ -714,6 +727,9 @@ def build_ui() -> gr.Blocks:
         # Switching codec moves the quality to that codec's default, unless it was customised.
         codec.change(lambda c, q: DEFAULT_CQ[c] if q in DEFAULT_CQ.values() else gr.skip(),
                      [codec, cq], cq)
+        # Fitting a size limit: switch to the most efficient codec this GPU can encode.
+        fit_ifttt.change(lambda on: "av1" if on and hw["av1_nvenc"] else gr.skip(),
+                         fit_ifttt, codec)
 
         plan_btn.click(check_plan, inputs, [status, plan_box])
         preview_btn.click(render_preview, inputs, outputs)
