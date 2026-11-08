@@ -33,6 +33,7 @@ from pathlib import Path
 import gradio as gr
 
 import make_dance_video as mdv
+import youtube_queue as ytq
 
 HERE = mdv.HERE
 ON_COLAB = "COLAB_RELEASE_TAG" in os.environ or Path("/content").is_dir()
@@ -59,6 +60,7 @@ HW_CHOICES = [("Auto", "auto"), ("GPU (NVIDIA)", "gpu"), ("CPU", "cpu")]
 UPLOAD, PATHS = "upload", "paths"
 
 JOB: dict = {}                      # the running render: {"proc": Popen, "cancel": bool}
+LAST_FULL: dict = {}                # the last finished full video: {"path": Path}
 RENDER_LOCK = threading.Lock()      # one render at a time
 _probe_cache: dict = {}
 
@@ -502,6 +504,8 @@ def _render(preview: bool, vals: tuple):
             else:
                 size = plan.output.stat().st_size / 1e6
                 msg = f"Done in {elapsed}: {plan.output}  ({size:,.0f} MB)"
+                if not preview:
+                    LAST_FULL["path"] = plan.output
                 if downloadable(plan.output):
                     video = str(plan.output) if preview else None
                     yield status_html(msg, 100, kind="ok"), summary, log, video, str(plan.output)
@@ -531,7 +535,39 @@ def render_preview(*vals):
 
 
 def render_full(*vals):
-    yield from _render(False, vals)
+    """Render, then (if ticked) queue the finished video for YouTube.
+
+    vals = the FIELDS values, then the YouTube settings (auto, title, description).
+    Yields one extra output: the "Video to send" box, filled with the new video's path.
+    """
+    plan_vals, yt = vals[:len(FIELDS)], vals[len(FIELDS):]
+    yt_auto, yt_title, yt_desc = (yt + (False, "", ""))[:3]
+    LAST_FULL.clear()
+    for update in _render(False, plan_vals):
+        yield *update, gr.update()
+    path = LAST_FULL.get("path")
+    if path is None:
+        return
+    yield gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), str(path)
+    if yt_auto:
+        for msg in send_to_youtube(str(path), yt_title, yt_desc):
+            yield msg, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+
+
+def send_to_youtube(video: str, title: str, description: str):
+    """Generator of status updates while a Drive video is queued for YouTube (via IFTTT)."""
+    video = (video or "").strip()
+    if not video:
+        yield status_html("Enter the path of a finished video on Google Drive.", kind="error")
+        return
+    try:
+        for msg in ytq.queue_video(video, title, description):
+            done = msg.startswith("Queued")
+            yield status_html(msg, 100 if done else None, kind="ok" if done else "info")
+    except ytq.QueueError as exc:
+        yield status_html(f"Not sent to YouTube: {exc}", kind="error")
+    except Exception as exc:
+        yield status_html(f"Not sent to YouTube: {type(exc).__name__}: {exc}", kind="error")
 
 
 def stop_render():
@@ -626,6 +662,21 @@ def build_ui() -> gr.Blocks:
                         overlay_fade_in = gr.Number(value=0.5, minimum=0, label="Fade in (s)")
                         overlay_fade_out = gr.Number(value=1.0, minimum=0, label="Fade out (s)")
 
+        with gr.Accordion("Send to YouTube (via IFTTT)", open=False, visible=ON_COLAB):
+            gr.Markdown("Shares the finished video on Google Drive and adds it to the "
+                        "**YouTube Queue** sheet; your IFTTT Applet then uploads it to YouTube. "
+                        "Needs the video saved in Google Drive and the Google sign-in from "
+                        "cell 2 of the notebook.")
+            yt_auto = gr.Checkbox(value=False,
+                                  label="Send each full video to YouTube when it finishes")
+            yt_title = gr.Textbox(label="YouTube title (blank = the file name)", max_lines=1,
+                                  max_length=ytq.TITLE_MAX)
+            yt_desc = gr.Textbox(label="YouTube description (optional)", lines=3)
+            with gr.Row():
+                yt_video = gr.Textbox(label="Video to send (path on Google Drive)", max_lines=1,
+                                      scale=3)
+                yt_btn = gr.Button("Send to YouTube", scale=1)
+
         with gr.Row():
             preview_len = gr.Number(value=30, minimum=1, maximum=900, precision=0,
                                     label="Preview length (s)", scale=1)
@@ -666,7 +717,8 @@ def build_ui() -> gr.Blocks:
 
         plan_btn.click(check_plan, inputs, [status, plan_box])
         preview_btn.click(render_preview, inputs, outputs)
-        render_btn.click(render_full, inputs, outputs)
+        render_btn.click(render_full, inputs + [yt_auto, yt_title, yt_desc], outputs + [yt_video])
+        yt_btn.click(send_to_youtube, [yt_video, yt_title, yt_desc], status)
         stop_btn.click(stop_render, None, status)
     return demo
 
