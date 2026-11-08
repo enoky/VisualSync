@@ -266,8 +266,9 @@ CPU_PRESETS = {"p1": "ultrafast", "p2": "superfast", "p3": "veryfast", "p4": "fa
 SVTAV1_PRESETS = {"p1": "12", "p2": "11", "p3": "10", "p4": "9", "p5": "8", "p6": "7", "p7": "6"}
 CPU_ENCODERS = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
 
-# --target-size: aim this far under the limit, since one-pass bitrate control drifts a little.
-SIZE_MARGIN = 0.95
+# --target-size: aim this far under the limit. NVENC's VBR overshot its average by ~10%
+# on a real 1-hour mix, so leave room for that.
+SIZE_MARGIN = 0.85
 MIN_VIDEO_KBPS = 250            # below this the picture falls apart; refuse instead
 SIZE_MODE_MAX_AUDIO_KBPS = 160  # in --target-size mode, spend the bytes on the picture
 
@@ -400,7 +401,7 @@ class Plan:
         vk = self.video_kbps
         # Size mode: average bitrate, with peaks allowed for busy scenes.
         rate = ([] if vk is None else
-                ["-b:v", f"{vk:.0f}k", "-maxrate", f"{vk * 2:.0f}k", "-bufsize", f"{vk * 4:.0f}k"])
+                ["-b:v", f"{vk:.0f}k", "-maxrate", f"{vk * 1.5:.0f}k", "-bufsize", f"{vk * 3:.0f}k"])
         if s.cpu_encode:
             if s.codec == "av1":   # SVT-AV1: plain average bitrate (no VBV), picks its own B-frames
                 quality = ["-crf", str(s.cq)] if vk is None else ["-b:v", f"{vk:.0f}k"]
