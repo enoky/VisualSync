@@ -292,6 +292,7 @@ class Settings:
     bars: int | None = None              # None = nearest whole number of bars
     beats_per_bar: int = 4
     offset: float = 0.0                  # first downbeat, in ORIGINAL mix time
+    trim_end: int = 0                    # drop this many frames (at the clips' frame rate) from the end of every clip
     fps: float | None = None             # None = same as the clips
     width: int = 1920
     height: int = 1080
@@ -346,12 +347,21 @@ class Plan:
         return abs(self.ratio - 1) > 1e-9
 
     @property
+    def clip_frames(self) -> int:
+        """Frames used from each clip (after --trim-end)."""
+        return self.inputs.ref.frames - self.settings.trim_end
+
+    @property
+    def clip_duration(self) -> float:
+        return float(self.clip_frames / self.inputs.ref.fps)
+
+    @property
     def speed(self) -> float:
-        return self.inputs.ref.duration / self.segment
+        return self.clip_duration / self.segment
 
     @property
     def frame_step(self) -> float:
-        return self.segment / self.inputs.ref.frames
+        return self.segment / self.clip_frames
 
     @property
     def encoder(self) -> str:
@@ -460,7 +470,10 @@ class Plan:
             f"  Tempo       : {round(self.bpm, 4):g} BPM  ->  1 bar = {self.bar:.4f} s",
             f"  Clips       : {len(self.inputs.clips)} x {ref.frames} frames @ {float(ref.fps):g} fps "
             f"= {ref.duration:.4f} s, {ref.width}x{ref.height}",
-            f"  Each clip   : {ref.duration:.4f} s -> {self.segment:.4f} s ({self.bars} bars), "
+            *([f"  Trim end    : last {s.trim_end} frame{'s' if s.trim_end != 1 else ''} of each clip "
+               f"dropped ({s.trim_end / float(ref.fps) * 1000:.0f} ms), {self.clip_frames} frames used"]
+              if s.trim_end else []),
+            f"  Each clip   : {self.clip_duration:.4f} s -> {self.segment:.4f} s ({self.bars} bars), "
             f"speed x{self.speed:.4f} ({(self.speed - 1) * 100:+.2f}%)",
             f"  Output      : {s.width}x{s.height} @ {float(self.out_fps):g} fps, "
             f"~{self.segment * float(self.out_fps):.2f} frames per clip, {self.encoder_label()} "
@@ -494,6 +507,12 @@ class Plan:
         # durations), so the picture stays locked to the beat for the full mix.
         timing = (f"settb=1/1000000,"
                   f"setpts='N*{self.frame_step * 1e6:.6f}-{self.shift * 1e6:.3f}'")
+        if s.trim_end:
+            # Every clip has exactly ref.frames frames, so the last trim_end of each are
+            # the ones whose position in the sequence (mod ref.frames) is at the end.
+            # setpts' N then counts only the kept frames, so the timing stays exact.
+            frames = self.inputs.ref.frames
+            timing = f"select='lt(mod(n\\,{frames})\\,{self.clip_frames})'," + timing
         if self.shift > 0:
             timing += ",trim=start=0"
         timing += f",fps=fps={self.out_fps}:start_time=0"
@@ -576,6 +595,9 @@ def make_plan(inputs: Inputs, s: Settings, base_dir: Path = HERE) -> Plan:
         raise RenderError("Bars per clip must be at least 1")
     if s.beats_per_bar < 1:
         raise RenderError("Beats per bar must be at least 1")
+    if not 0 <= s.trim_end <= inputs.ref.frames // 2:
+        raise RenderError(f"Trim end must be between 0 and {inputs.ref.frames // 2} frames "
+                          f"(the clips have {inputs.ref.frames})")
     if s.overlay is not None:
         if not Path(s.overlay).is_file():
             raise RenderError(f"Overlay image not found: {s.overlay}")
@@ -607,7 +629,8 @@ def make_plan(inputs: Inputs, s: Settings, base_dir: Path = HERE) -> Plan:
     ref = inputs.ref
     out_fps = Fraction(s.fps).limit_denominator(1001) if s.fps else ref.fps
     bar = s.beats_per_bar * 60.0 / target_bpm
-    bars = s.bars or max(1, round(ref.duration / bar))
+    clip_duration = float((ref.frames - s.trim_end) / ref.fps)
+    bars = s.bars or max(1, round(clip_duration / bar))
     segment = bars * bar
 
     target_dur = min(mix_dur, s.preview) if s.preview else mix_dur
@@ -700,6 +723,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bars", type=int,
                     help="bars per clip (default: whole number of bars closest to the clip length)")
     ap.add_argument("--beats-per-bar", type=int, default=4)
+    ap.add_argument("--trim-end", type=int, default=0, metavar="FRAMES",
+                    help="drop the last FRAMES frames of every clip (counted at the clips' own "
+                         "frame rate), e.g. to hide glitchy endings of AI-generated clips")
     ap.add_argument("--offset", type=float, default=0.0,
                     help="time of the first downbeat in the ORIGINAL mix, in seconds "
                          "(clip cuts are aligned to it)")
