@@ -290,7 +290,7 @@ def cache_drive_clips(plan: mdv.Plan) -> int:
 # --------------------------------------------------------------------------- #
 FIELDS = ["mode", "clip_files", "mix_file", "clips_dir", "mix_path", "output_dir",
           "bpm", "retempo", "target_bpm", "stretch", "bars", "beats_per_bar", "offset",
-          "trim_end", "resolution", "codec", "cq", "preset", "audio_bitrate", "fade", "audio_fade", "fps",
+          "trim_end", "clip_bpm", "resolution", "codec", "cq", "preset", "audio_bitrate", "fade", "audio_fade", "fps",
           "encode", "decode",
           "overlay_on", "overlay", "overlay_size", "overlay_start", "overlay_duration",
           "overlay_fade_in", "overlay_fade_out", "preview_len", "fit_ifttt"]
@@ -336,6 +336,7 @@ def make_plan(vals: tuple, preview: bool) -> tuple[mdv.Plan, dict]:
         beats_per_bar=int(num(v["beats_per_bar"], 4)),
         offset=num(v["offset"]),
         trim_end=int(num(v["trim_end"])),
+        clip_bpm=num(v["clip_bpm"]) or None,
         fps=num(v["fps"]) or None,
         width=width, height=height,
         fade=num(v["fade"], 4.0),
@@ -635,11 +636,17 @@ def build_ui() -> gr.Blocks:
                 beats_per_bar = gr.Number(value=4, precision=0, minimum=1, maximum=16,
                                           label="Beats per bar")
                 offset = gr.Number(value=0.0, minimum=0, label="First downbeat in the mix (s)")
+                clip_bpm = gr.Number(value=128, minimum=0, maximum=250,
+                                     label="Dancer tempo (BPM, 0 = off)",
+                                     info="The tempo the dancers move to. Each clip is cut to exactly "
+                                          "whole bars of it (e.g. 8 bars = 15.000 s at 128), so the "
+                                          "moves land on the music's beat.")
                 trim_end = gr.Number(value=0, precision=0, minimum=0, maximum=60,
                                      label="Trim end of each clip (frames)",
                                      info="Drops glitchy last frames, counted at the clips' own "
                                           "frame rate (48 fps clips: 2 frames = 1 frame at 24 fps). "
-                                          "The beat sync adjusts automatically.")
+                                          "Extra frames past the dancer's last bar are already "
+                                          "dropped; this only matters if glitches remain.")
             with gr.Column():
                 gr.Markdown("### Video & audio")
                 resolution = gr.Dropdown(RESOLUTIONS, value="1920x1080", label="Resolution")
@@ -716,7 +723,7 @@ def build_ui() -> gr.Blocks:
 
         inputs = [mode, clip_files, mix_file, clips_dir, mix_path, output_dir,
                   bpm, retempo, target_bpm, stretch, bars, beats_per_bar, offset,
-                  trim_end, resolution, codec, cq, preset, audio_bitrate, fade, audio_fade, fps,
+                  trim_end, clip_bpm, resolution, codec, cq, preset, audio_bitrate, fade, audio_fade, fps,
                   encode, decode,
                   overlay_on, overlay, overlay_size, overlay_start, overlay_duration,
                   overlay_fade_in, overlay_fade_out, preview_len, fit_ifttt]

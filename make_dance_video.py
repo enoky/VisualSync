@@ -293,6 +293,7 @@ class Settings:
     beats_per_bar: int = 4
     offset: float = 0.0                  # first downbeat, in ORIGINAL mix time
     trim_end: int = 0                    # drop this many frames (at the clips' frame rate) from the end of every clip
+    clip_bpm: float | None = None        # tempo the dancers move to; clips are cut to whole bars of it
     fps: float | None = None             # None = same as the clips
     width: int = 1920
     height: int = 1080
@@ -335,6 +336,9 @@ class Plan:
     scaled: tuple[int, int]
     audio_chain: list[str]
     output: Path
+    clip_frames: int          # frames used from each clip (the rest are dropped)
+    grid_frames: float        # length of the clip's beat grid, in frames (>= clip_frames)
+    clip_bars: int | None     # whole bars at the dancer tempo (None = no dancer tempo set)
     # Render here instead of next to the output, then copy the finished file over
     # (e.g. local disk on Colab, so +faststart's rewrite doesn't run on Google Drive).
     work_dir: Path | None = None
@@ -347,13 +351,14 @@ class Plan:
         return abs(self.ratio - 1) > 1e-9
 
     @property
-    def clip_frames(self) -> int:
-        """Frames used from each clip (after --trim-end)."""
-        return self.inputs.ref.frames - self.settings.trim_end
+    def clip_duration(self) -> float:
+        """Length of the part of each clip that's mapped onto the bars."""
+        return self.grid_frames / float(self.inputs.ref.fps)
 
     @property
-    def clip_duration(self) -> float:
-        return float(self.clip_frames / self.inputs.ref.fps)
+    def hold_frames(self) -> float:
+        """Source frames at the end of each clip covered by holding the last kept frame."""
+        return max(0.0, self.grid_frames - self.clip_frames)
 
     @property
     def speed(self) -> float:
@@ -361,7 +366,7 @@ class Plan:
 
     @property
     def frame_step(self) -> float:
-        return self.segment / self.clip_frames
+        return self.segment / self.grid_frames
 
     @property
     def encoder(self) -> str:
@@ -470,9 +475,7 @@ class Plan:
             f"  Tempo       : {round(self.bpm, 4):g} BPM  ->  1 bar = {self.bar:.4f} s",
             f"  Clips       : {len(self.inputs.clips)} x {ref.frames} frames @ {float(ref.fps):g} fps "
             f"= {ref.duration:.4f} s, {ref.width}x{ref.height}",
-            *([f"  Trim end    : last {s.trim_end} frame{'s' if s.trim_end != 1 else ''} of each clip "
-               f"dropped ({s.trim_end / float(ref.fps) * 1000:.0f} ms), {self.clip_frames} frames used"]
-              if s.trim_end else []),
+            *self._clip_cut_lines(),
             f"  Each clip   : {self.clip_duration:.4f} s -> {self.segment:.4f} s ({self.bars} bars), "
             f"speed x{self.speed:.4f} ({(self.speed - 1) * 100:+.2f}%)",
             f"  Output      : {s.width}x{s.height} @ {float(self.out_fps):g} fps, "
@@ -494,6 +497,27 @@ class Plan:
         lines.append(f"  File        : {self.output}")
         return lines
 
+    def _clip_cut_lines(self) -> list[str]:
+        s, ref = self.settings, self.inputs.ref
+        ms = lambda frames: f"{frames / float(ref.fps) * 1000:.0f} ms"   # noqa: E731
+        dropped = ref.frames - self.clip_frames
+        lines = []
+        if self.clip_bars:
+            grid = round(self.grid_frames, 2)
+            lines.append(f"  Dancer beat : {s.clip_bpm:g} BPM -> {self.clip_bars} bars = {grid:g} frames "
+                         f"of {ref.frames}; {dropped} dropped from the end ({ms(dropped)})")
+            if self.hold_frames > 0.5:
+                lines.append(f"  Trim end    : last good frame held for {ms(self.hold_frames)} "
+                             f"to keep the moves on the beat")
+            bar_frames = self.grid_frames / self.clip_bars
+            if ref.frames - self.grid_frames > bar_frames / 4:
+                lines.append(f"  NOTE        : the clips are {ms(ref.frames - self.grid_frames)} longer than "
+                             f"{self.clip_bars} bars at {s.clip_bpm:g} BPM - check the dancer tempo")
+        elif dropped:
+            lines.append(f"  Trim end    : last {dropped} frame{'s' if dropped != 1 else ''} of each clip "
+                         f"dropped ({ms(dropped)}), {self.clip_frames} frames used")
+        return lines
+
     def concat_text(self) -> str:
         return "ffconcat version 1.0\n" + "".join(f"file '{concat_escape(p)}'\n" for p in self.playlist)
 
@@ -505,12 +529,20 @@ class Plan:
         # settb=1/1e6 -> timestamps in microseconds; frame N of the whole sequence
         # is placed at N * frame_step. Computed from N (not from accumulated
         # durations), so the picture stays locked to the beat for the full mix.
-        timing = (f"settb=1/1000000,"
-                  f"setpts='N*{self.frame_step * 1e6:.6f}-{self.shift * 1e6:.3f}'")
-        if s.trim_end:
-            # Every clip has exactly ref.frames frames, so the last trim_end of each are
-            # the ones whose position in the sequence (mod ref.frames) is at the end.
-            # setpts' N then counts only the kept frames, so the timing stays exact.
+        step, shift = self.frame_step * 1e6, self.shift * 1e6
+        if self.hold_frames > 1e-6:
+            # Frames keep their place on the clip's own beat grid: clip k starts at
+            # k * segment and its frame i sits at i * step. The gap left by the dropped
+            # end frames is filled by the fps filter repeating the last kept frame.
+            k = self.clip_frames
+            pts = f"floor(N/{k})*{self.segment * 1e6:.6f}+mod(N\\,{k})*{step:.6f}"
+        else:
+            pts = f"N*{step:.6f}"
+        timing = f"settb=1/1000000,setpts='{pts}-{shift:.3f}'"
+        if self.clip_frames < self.inputs.ref.frames:
+            # Every clip has exactly ref.frames frames, so the dropped ones are those whose
+            # position in the sequence (mod ref.frames) is past clip_frames. setpts' N then
+            # counts only the kept frames.
             frames = self.inputs.ref.frames
             timing = f"select='lt(mod(n\\,{frames})\\,{self.clip_frames})'," + timing
         if self.shift > 0:
@@ -629,8 +661,25 @@ def make_plan(inputs: Inputs, s: Settings, base_dir: Path = HERE) -> Plan:
     ref = inputs.ref
     out_fps = Fraction(s.fps).limit_denominator(1001) if s.fps else ref.fps
     bar = s.beats_per_bar * 60.0 / target_bpm
-    clip_duration = float((ref.frames - s.trim_end) / ref.fps)
-    bars = s.bars or max(1, round(clip_duration / bar))
+    usable = ref.frames - s.trim_end
+    if s.clip_bpm:
+        # Cut each clip to whole bars of the dancers' own tempo, so their moves map
+        # bar-for-bar onto the music. Extra frames past the last whole bar are dropped;
+        # trimmed frames inside it are covered by holding the last good frame.
+        check_bpm(s.clip_bpm, "Dancer tempo")
+        bar_frames = s.beats_per_bar * 60.0 / s.clip_bpm * float(ref.fps)
+        clip_bars = math.floor(ref.frames / bar_frames + 1e-6)
+        if clip_bars < 1:
+            raise RenderError(f"The clips ({ref.duration:.2f} s) are shorter than one bar at "
+                              f"{s.clip_bpm:g} BPM")
+        grid_frames = clip_bars * bar_frames
+        clip_frames = min(usable, math.floor(grid_frames + 1e-6))
+        bars = s.bars or clip_bars
+    else:
+        clip_bars = None
+        clip_frames = usable
+        grid_frames = float(usable)
+        bars = s.bars or max(1, round(usable / float(ref.fps) / bar))
     segment = bars * bar
 
     target_dur = min(mix_dur, s.preview) if s.preview else mix_dur
@@ -671,7 +720,8 @@ def make_plan(inputs: Inputs, s: Settings, base_dir: Path = HERE) -> Plan:
                 mix_dur=mix_dur, target_dur=target_dur, fade=fade, bar=bar, bars=bars,
                 segment=segment, offset=offset, shift=shift, out_fps=out_fps, playlist=playlist,
                 scaled=cover_size(ref.width, ref.height, s.width, s.height),
-                audio_chain=audio_chain, output=output)
+                audio_chain=audio_chain, output=output,
+                clip_frames=clip_frames, grid_frames=grid_frames, clip_bars=clip_bars)
 
 
 def finish_output(plan: Plan, success: bool) -> None:
@@ -726,6 +776,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--trim-end", type=int, default=0, metavar="FRAMES",
                     help="drop the last FRAMES frames of every clip (counted at the clips' own "
                          "frame rate), e.g. to hide glitchy endings of AI-generated clips")
+    ap.add_argument("--clip-bpm", type=float, metavar="BPM",
+                    help="tempo the dancers move to (e.g. 128): each clip is cut to exactly whole "
+                         "bars at that tempo, so the moves land on the music's beat; with "
+                         "--trim-end, the last good frame is held instead of stretching the clip")
     ap.add_argument("--offset", type=float, default=0.0,
                     help="time of the first downbeat in the ORIGINAL mix, in seconds "
                          "(clip cuts are aligned to it)")

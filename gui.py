@@ -176,6 +176,10 @@ class MainWindow(QMainWindow):
         self.bars_spin.setToolTip("Bars each clip is stretched to. Auto = closest to the clip's length.")
         self.offset_spin = dspin(0, 600, 3, 0.01, " s")
         self.offset_spin.setToolTip("Time of the first downbeat in the original mix")
+        self.clip_bpm_spin = dspin(0, 250, 2, 0.5, " BPM")
+        self.clip_bpm_spin.setSpecialValueText("Off")
+        self.clip_bpm_spin.setToolTip("Tempo the dancers move to. Each clip is cut to exactly whole bars\n"
+                                      "of it (e.g. 8 bars = 15.000 s at 128 BPM), so the moves land on the beat.")
         self.trim_spin = QSpinBox()
         self.trim_spin.setRange(0, 60)
         self.trim_spin.setSpecialValueText("Off")
@@ -188,6 +192,7 @@ class MainWindow(QMainWindow):
         f.addRow("Stretch", self.stretch_combo)
         f.addRow("Clip length", self.bars_spin)
         f.addRow("First downbeat", self.offset_spin)
+        f.addRow("Dancer tempo", self.clip_bpm_spin)
         f.addRow("Trim clip ends", self.trim_spin)
         mid.addWidget(self.tempo_box, 1)
 
@@ -308,6 +313,7 @@ class MainWindow(QMainWindow):
         self.audio_edit.textChanged.connect(self.probe_timer.start)
         self.output_edit.textChanged.connect(self.plan_timer.start)
         for sb in (self.bpm_spin, self.target_spin, self.bars_spin, self.offset_spin, self.trim_spin,
+                   self.clip_bpm_spin,
                    self.cq_spin, self.fade_spin, self.preview_spin, self.overlay_size_spin,
                    self.overlay_start_spin, self.overlay_dur_spin, self.overlay_fin_spin,
                    self.overlay_fout_spin):
@@ -351,6 +357,7 @@ class MainWindow(QMainWindow):
         self.bars_spin.setValue(int(st.value("bars", 0)))
         self.offset_spin.setValue(float(st.value("offset", 0.0)))
         self.trim_spin.setValue(int(st.value("trim_end", 0)))
+        self.clip_bpm_spin.setValue(float(st.value("clip_bpm", 128.0)))
         set_combo(self.res_combo, "1920x1080")
         set_combo(self.res_combo, st.value("resolution", "1920x1080"))
         set_combo(self.codec_combo, st.value("codec", "hevc"))
@@ -382,6 +389,7 @@ class MainWindow(QMainWindow):
             "retempo": self.retempo_check.isChecked(), "target_bpm": self.target_spin.value(),
             "stretch": self.stretch_combo.currentData(), "bars": self.bars_spin.value(),
             "offset": self.offset_spin.value(), "trim_end": self.trim_spin.value(),
+            "clip_bpm": self.clip_bpm_spin.value(),
             "resolution": self.res_combo.currentData(),
             "codec": self.codec_combo.currentData(), "cq": self.cq_spin.value(),
             "preset": self.preset_combo.currentData(),
@@ -421,6 +429,7 @@ class MainWindow(QMainWindow):
             bars=self.bars_spin.value() or None,
             offset=self.offset_spin.value(),
             trim_end=self.trim_spin.value(),
+            clip_bpm=self.clip_bpm_spin.value() or None,
             width=w, height=h,
             fade=self.fade_spin.value(),
             audio_fade=self.audio_fade_check.isChecked(),
